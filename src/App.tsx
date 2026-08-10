@@ -1,4 +1,5 @@
 import { useEffect, useState } from 'react';
+import { ERROR_CODES, ConnectError } from '@unicitylabs/sphere-sdk/connect';
 import { useWalletConnect } from './hooks/useWalletConnect';
 import {
   createMarket,
@@ -14,6 +15,7 @@ import {
 } from './lib/market';
 import { computeReputation, MIN_STAKE_AGE_DAYS, type ReputationResult } from './lib/reputation';
 import { parseAmount, truncate } from './lib/format';
+import { isUnresolved, markUnresolved, clearUnresolved } from './lib/pendingIntents';
 import type { HistoryEntry } from './lib/types';
 
 // Real testnet UCT coinId (lowercase 64-hex) — the SDK requires this exact
@@ -220,8 +222,20 @@ function MarketCard({
   const isCreator = identityKey === market.createdBy;
   const isExpired = Date.now() > market.resolveBy;
 
+  // Guards against double-paying when a transfer intent's outcome is UNKNOWN
+  // (wallet locked / host deadline fired *after* the wallet already had the
+  // request — see lib/pendingIntents.ts). The SDK is explicit that a dApp
+  // must not retry in that case, so instead of silently re-enabling the
+  // button we block it until the user confirms they've checked their
+  // wallet history and it's safe to try again.
+  const voteKey = identityKey ? `vote:${market.id}:${identityKey}` : null;
+  const [voteUnresolved, setVoteUnresolved] = useState(() => (voteKey ? isUnresolved(voteKey) : false));
+  const [unresolvedPayouts, setUnresolvedPayouts] = useState<Set<string>>(
+    () => new Set((market.payouts ?? []).filter((p) => isUnresolved(`payout:${market.id}:${p.identityKey}`)).map((p) => p.identityKey)),
+  );
+
   const vote = async (side: Side) => {
-    if (!identityKey || !reputation) return;
+    if (!identityKey || !reputation || !voteKey || isUnresolved(voteKey)) return;
     const stakeHuman = Number(stake);
     if (!stakeHuman || stakeHuman <= 0) return;
     setBusy(true);
@@ -239,9 +253,22 @@ function MarketCard({
       if (updated) onVoted(updated);
     } catch (err) {
       console.error('Vote failed', err);
+      // Outcome unknown (4201): the transfer may have already gone through.
+      // Do NOT let the user immediately retry — that's how a double-spend
+      // happens. Block until they explicitly confirm they've checked.
+      if (err instanceof ConnectError && err.code === ERROR_CODES.INTENT_OUTCOME_UNKNOWN) {
+        markUnresolved(voteKey);
+        setVoteUnresolved(true);
+      }
     } finally {
       setBusy(false);
     }
+  };
+
+  const confirmVoteRetry = () => {
+    if (!voteKey) return;
+    clearUnresolved(voteKey);
+    setVoteUnresolved(false);
   };
 
   const resolve = (outcome: Side) => {
@@ -250,6 +277,8 @@ function MarketCard({
   };
 
   const sendPayout = async (payout: Payout) => {
+    const payoutKey = `payout:${market.id}:${payout.identityKey}`;
+    if (isUnresolved(payoutKey)) return;
     setSendingKey(payout.identityKey);
     try {
       // Autonomous settlement: sent directly peer-to-peer, no custodian in between.
@@ -262,9 +291,23 @@ function MarketCard({
       if (updated) onUpdated(updated);
     } catch (err) {
       console.error('Settle payout failed', err);
+      // Same 4201 guard as vote() above — never auto-retry an ambiguous payout.
+      if (err instanceof ConnectError && err.code === ERROR_CODES.INTENT_OUTCOME_UNKNOWN) {
+        markUnresolved(payoutKey);
+        setUnresolvedPayouts((prev) => new Set(prev).add(payout.identityKey));
+      }
     } finally {
       setSendingKey(null);
     }
+  };
+
+  const confirmPayoutRetry = (payoutIdentityKey: string) => {
+    clearUnresolved(`payout:${market.id}:${payoutIdentityKey}`);
+    setUnresolvedPayouts((prev) => {
+      const next = new Set(prev);
+      next.delete(payoutIdentityKey);
+      return next;
+    });
   };
 
   return (
@@ -287,7 +330,22 @@ function MarketCard({
         </div>
       </div>
 
-      {market.status === 'open' && wallet.isConnected && !alreadyVoted && (
+      {market.status === 'open' && wallet.isConnected && !alreadyVoted && voteUnresolved && (
+        <div className="mt-3 bg-amber-950/40 border border-amber-800/60 rounded-lg px-3 py-2">
+          <p className="text-xs text-amber-300">
+            Your last vote's outcome is unknown — the transfer may have already gone through. Check your wallet
+            history before trying again.
+          </p>
+          <button
+            className="mt-2 text-xs bg-amber-800/60 hover:bg-amber-800 text-amber-100 px-3 py-1 rounded-full"
+            onClick={confirmVoteRetry}
+          >
+            I checked — allow retry
+          </button>
+        </div>
+      )}
+
+      {market.status === 'open' && wallet.isConnected && !alreadyVoted && !voteUnresolved && (
         <div className="flex items-center gap-2 mt-3">
           <input
             type="number"
@@ -338,20 +396,36 @@ function MarketCard({
           </p>
           {market.payouts.map((p) => {
             const isSent = !!market.settled?.[p.identityKey];
+            const isUnresolvedPayout = unresolvedPayouts.has(p.identityKey);
             return (
-              <div key={p.identityKey} className="flex items-center justify-between text-sm bg-neutral-950 rounded-lg px-3 py-2">
-                <span className="font-mono text-xs">{truncate(p.identityKey)}</span>
-                <span>{p.payoutHuman.toFixed(2)} UCT</span>
-                {isCreator ? (
-                  <button
-                    className="text-xs bg-neutral-100 text-black px-2 py-1 rounded-full disabled:opacity-40"
-                    disabled={isSent || sendingKey === p.identityKey}
-                    onClick={() => sendPayout(p)}
-                  >
-                    {isSent ? 'Sent ✓' : sendingKey === p.identityKey ? 'Sending…' : 'Send'}
-                  </button>
-                ) : (
-                  <span className="text-xs text-neutral-500">{isSent ? 'Sent ✓' : 'Pending'}</span>
+              <div key={p.identityKey} className="bg-neutral-950 rounded-lg px-3 py-2">
+                <div className="flex items-center justify-between text-sm">
+                  <span className="font-mono text-xs">{truncate(p.identityKey)}</span>
+                  <span>{p.payoutHuman.toFixed(2)} UCT</span>
+                  {isCreator && !isUnresolvedPayout ? (
+                    <button
+                      className="text-xs bg-neutral-100 text-black px-2 py-1 rounded-full disabled:opacity-40"
+                      disabled={isSent || sendingKey === p.identityKey}
+                      onClick={() => sendPayout(p)}
+                    >
+                      {isSent ? 'Sent ✓' : sendingKey === p.identityKey ? 'Sending…' : 'Send'}
+                    </button>
+                  ) : !isCreator ? (
+                    <span className="text-xs text-neutral-500">{isSent ? 'Sent ✓' : 'Pending'}</span>
+                  ) : null}
+                </div>
+                {isCreator && isUnresolvedPayout && (
+                  <div className="mt-2 bg-amber-950/40 border border-amber-800/60 rounded-lg px-2 py-1.5">
+                    <p className="text-[11px] text-amber-300">
+                      Outcome unknown — this payout may have already been sent. Check wallet history first.
+                    </p>
+                    <button
+                      className="mt-1 text-[11px] bg-amber-800/60 hover:bg-amber-800 text-amber-100 px-2 py-0.5 rounded-full"
+                      onClick={() => confirmPayoutRetry(p.identityKey)}
+                    >
+                      I checked — allow retry
+                    </button>
+                  </div>
                 )}
               </div>
             );
