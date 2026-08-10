@@ -1,5 +1,5 @@
 import { useState, useRef, useCallback, useEffect } from 'react';
-import { ConnectClient, HOST_READY_TYPE, HOST_READY_TIMEOUT, WALLET_EVENTS, SPHERE_NETWORKS } from '@unicitylabs/sphere-sdk/connect';
+import { ConnectClient, HOST_READY_TYPE, HOST_READY_TIMEOUT, WALLET_EVENTS, SPHERE_NETWORKS, PERMISSION_SCOPES } from '@unicitylabs/sphere-sdk/connect';
 import { PostMessageTransport, ExtensionTransport } from '@unicitylabs/sphere-sdk/connect/browser';
 import type { ConnectTransport, PublicIdentity, RpcMethod, IntentAction } from '@unicitylabs/sphere-sdk/connect';
 import type { PermissionScope } from '@unicitylabs/sphere-sdk/connect';
@@ -89,11 +89,28 @@ export function useWalletConnect(): UseWalletConnect {
     url: location.origin,
   } as const;
 
+  // Vouch only ever reads identity + tx history (for reputation scoring) and
+  // requests transfers (stake + payout). Without an explicit `permissions`
+  // list, ConnectClient defaults to ALL_PERMISSIONS (13 scopes, including
+  // DM read/manage, mint, sign-message, payment-request) which the wallet's
+  // approval modal shows to the user even though this app never calls them.
+  const REQUESTED_PERMISSIONS: PermissionScope[] = [
+    PERMISSION_SCOPES.IDENTITY_READ,
+    PERMISSION_SCOPES.HISTORY_READ,
+    PERMISSION_SCOPES.TRANSFER_REQUEST,
+  ];
+
   const makeClient = (
     transport: ConnectTransport,
     extra: { resumeSessionId?: string; silent?: boolean } = {},
   ): ConnectClient =>
-    new ConnectClient({ transport, dapp: dappMeta, network: SPHERE_NETWORKS.testnet2, ...extra });
+    new ConnectClient({
+      transport,
+      dapp: dappMeta,
+      network: SPHERE_NETWORKS.testnet2,
+      permissions: REQUESTED_PERMISSIONS,
+      ...extra,
+    });
 
   /**
    * Open (or re-open) popup, create fresh transport + client, do handshake.
